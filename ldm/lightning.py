@@ -7,6 +7,8 @@ import lightning as L
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+import os
+import tarfile
 from PIL import Image
 
 
@@ -25,9 +27,9 @@ class PromptDataset(Dataset):
 class LightningStableDiffusion(L.LightningModule):
     def __init__(
         self,
-        config_path: str,
-        checkpoint_path: str,
         device: torch.device,
+        config_path: str = "configuration.yaml",
+        checkpoint_path: str =  "checkpoint.ckpt",
         size: int = 512,
     ):
         super().__init__()
@@ -74,3 +76,48 @@ class LightningStableDiffusion(L.LightningModule):
             x_samples_ddim = (255.0 * x_samples_ddim).astype(np.uint8)
             pil_results = [Image.fromarray(x_sample) for x_sample in x_samples_ddim]
         return pil_results
+
+
+
+def get_weights_version(version):
+
+        if version == 1.5:
+            os.system(
+                "curl -C - https://raw.githubusercontent.com/runwayml/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml -o configuration.yaml"
+            )
+
+            os.system(
+                "curl -C - https://pl-public-data.s3.amazonaws.com/dream_stable_diffusion/v1-5-pruned-emaonly.ckpt -o checkpoint.ckpt"
+            )
+
+        elif version == 1.4:
+            os.system(
+                "curl -C - https://raw.githubusercontent.com/runwayml/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml -o configuration.yaml"
+            )
+
+            os.system(
+                "curl -C -  https://pl-public-data.s3.amazonaws.com/dream_stable_diffusion/sd_weights.tar.gz -o checkpoint.tar.gz"
+            )
+            file = tarfile.open('checkpoint.tar.gz')
+            file.extractall()
+            file.close()
+        
+        elif version == 2.0:
+            os.system(
+                "curl -C - https://raw.githubusercontent.com/runwayml/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml -o configuration.yaml"
+            )
+
+            os.system(
+                "curl -C - https://pl-public-data.s3.amazonaws.com/dream_stable_diffusion/v1-5-pruned-emaonly.ckpt -o checkpoint.ckpt"
+            )
+        elif version == 2.1:
+            os.system(
+                "curl -C - https://raw.githubusercontent.com/runwayml/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml -o configuration.yaml"
+            )
+
+            os.system(
+                "curl -C - https://pl-public-data.s3.amazonaws.com/dream_stable_diffusion/v1-5-pruned-emaonly.ckpt -o checkpoint.ckpt"
+            )
+        else:
+            raise Exception("Error: Wrong version. Available versions: 1.4, 1.5, 2.0, and 2.1. Please ensure that you are using the correct version.")
+   
