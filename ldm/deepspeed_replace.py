@@ -16,7 +16,7 @@ from ldm.detect_target import _detect_cuda
 import logging
 import math
 from torch import nn, einsum
-from einops import rearrange, repeat
+from einops import rearrange
 
 if package_available("deepspeed"):
     import deepspeed.ops.transformer as transformer_inference
@@ -33,7 +33,6 @@ else:
         pass
 
 logger = logging.getLogger(__name__)
-inference_cuda_module = None
 
 class InferenceEngine(InferenceEngine):
 
@@ -332,14 +331,6 @@ class FlashAttention(nn.Module):
                                                 device=device),
                                     requires_grad=False)
         self.do_out_bias = True
-
-        global inference_cuda_module
-        if inference_cuda_module is None:
-            from deepspeed.ops import op_builder
-            builder = op_builder.InferenceBuilder()
-            inference_cuda_module = builder.load()
-
-        self.linear_func = inference_cuda_module.linear_layer_fp16
 
         self.norm_factor = math.sqrt(math.sqrt(hidden_size // heads))
 
