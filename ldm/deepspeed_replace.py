@@ -7,13 +7,16 @@ from functools import partial
 from dataclasses import dataclass
 import time
 from lightning_utilities.core.imports import package_available
-
+from torch import nn
 from ldm.modules.attention import CrossAttention, BasicTransformerBlock
 from ldm.models.diffusion.ddpm import DiffusionWrapper
 from ldm.models.autoencoder import AutoencoderKL
 from ldm.modules.encoders.modules import FrozenCLIPEmbedder
 from ldm.detect_target import _detect_cuda
 import logging
+import math
+from torch import nn, einsum
+from einops import rearrange, repeat
 
 if package_available("deepspeed"):
     import deepspeed.ops.transformer as transformer_inference
@@ -30,6 +33,7 @@ else:
         pass
 
 logger = logging.getLogger(__name__)
+inference_cuda_module = None
 
 class InferenceEngine(InferenceEngine):
 
@@ -224,12 +228,12 @@ class UNetPolicy(DSPolicy):
             return ReplayCudaGraphUnet(module, enable_cuda_graph=enable_cuda_graph)
         return module
 
-    def attention(self, client_module):
+    def attention(self, client_module, use_triton_attention: bool = True):
         qw = client_module.to_q.weight
         kw = client_module.to_k.weight
         vw = client_module.to_v.weight
 
-        if qw.shape[1] == kw.shape[1]:
+        if use_triton_attention and qw.shape[1] == kw.shape[1]:
             qkvw = torch.nn.Parameter(torch.cat((qw, kw, vw), dim=0), requires_grad=False)
 
             return qkvw, \
@@ -271,6 +275,7 @@ class ClipEncoderPolicy(DSPolicy):
 GENERIC_POLICIES = [UNetPolicy, VAEPolicy, ClipEncoderPolicy]
 
 
+
 def _module_match(module):
     for policy in GENERIC_POLICIES:
         policy = policy()
@@ -278,30 +283,164 @@ def _module_match(module):
             return policy
     return None
 
+
+class FlashAttention(nn.Module):
+
+    def __init__(self, hidden_size: int, hidden_size_out: int, heads: int, fp16: bool = True, device: str = "cuda", max_out_tokens: int = 4096):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.max_out_tokens = max_out_tokens
+        self.heads = heads
+
+        dtype = torch.float16 if fp16 else torch.float32
+
+        self.attn_kw = nn.Parameter(
+            torch.empty(
+                hidden_size,
+                hidden_size,
+                dtype=dtype,
+                device=device
+            ), requires_grad=False
+        )
+
+        self.attn_vw = nn.Parameter(
+            torch.empty(
+                hidden_size,
+                hidden_size,
+                dtype=dtype,
+                device=device
+            ), requires_grad=False)
+
+        self.attn_qw = nn.Parameter(
+            torch.empty(
+                hidden_size,
+                hidden_size_out,
+                dtype=dtype,
+                device=device
+            ), requires_grad=False
+        )
+
+        self.attn_ow = nn.Parameter(torch.empty(hidden_size,
+                                                hidden_size,
+                                                dtype=dtype,
+                                                device=device),
+                                    requires_grad=False)
+
+        self.attn_ob = nn.Parameter(torch.empty(hidden_size,
+                                                dtype=dtype,
+                                                device=device),
+                                    requires_grad=False)
+        self.do_out_bias = True
+
+        global inference_cuda_module
+        if inference_cuda_module is None:
+            from deepspeed.ops import op_builder
+            builder = op_builder.InferenceBuilder()
+            inference_cuda_module = builder.load()
+
+        self.linear_func = inference_cuda_module.linear_layer_fp16
+
+        self.norm_factor = math.sqrt(math.sqrt(hidden_size // heads))
+
+        self.scale = (1 / self.norm_factor) * (1 / self.norm_factor) 
+
+    def forward(self, input, context=None, input_mask=None):
+        from flash_attn.flash_attn_interface import _flash_attn_forward
+
+        batch_size = input.shape[0]
+        seqlen = input.shape[1]
+        cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=self.attn_kw.device)
+        do_flash_attn = (input.shape[-1] / self.heads <= 128) and context is None
+
+        if not do_flash_attn:
+            query = torch.matmul(input, self.attn_qw)
+            if context is None:
+                key = torch.matmul(input, self.attn_kw)
+                value = torch.matmul(input, self.attn_vw)
+            else:
+                key = torch.matmul(context, self.attn_kw)
+                value = torch.matmul(context, self.attn_vw)
+
+            query = rearrange(query, 'b n (h d) -> (b h) n d', h=self.heads)
+            key = rearrange(key, 'b n (h d) -> (b h) n d', h=self.heads)
+            value = rearrange(value, 'b n (h d) -> (b h) n d', h=self.heads)
+        else:
+            query = torch.matmul(input, self.attn_qw)
+            key = torch.matmul(input, self.attn_kw)
+            value = torch.matmul(input, self.attn_vw)
+
+            query = query.reshape((batch_size * seqlen, self.heads, -1)).contiguous()
+            key = key.reshape((batch_size * seqlen, self.heads, -1)).contiguous()
+            value = value.reshape((batch_size * seqlen, self.heads, -1)).contiguous()
+
+        if do_flash_attn:
+            context_layer, _, _ = _flash_attn_forward(query, key, value, torch.empty_like(query), cu_seqlens, cu_seqlens, seqlen, seqlen, 0.0, self.scale, causal=None, return_softmax=False)
+            context_layer = context_layer.reshape((batch_size, seqlen, -1))
+        else:
+            sim = einsum('b i d, b j d -> b i j', query, key) * self.scale
+            del query, key
+
+            sim = sim.softmax(dim=-1)
+
+            out = einsum('b i j, b j d -> b i d', sim, value)
+            context_layer = rearrange(out, '(b h) n d -> b n (h d)', h=self.heads)
+
+        return torch.matmul(context_layer, self.attn_ow)
+
+
+class DeepSpeedFlashDiffusersTransformerBlock(DeepSpeedDiffusersTransformerBlock):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if isinstance(self.attn_1, FlashAttention):
+            self.attn_1.do_out_bias = False
+            self.attn_1_bias = self.attn_1.attn_ob
+
+        if isinstance(self.attn_2, FlashAttention):
+            self.attn_2.do_out_bias = False
+            self.attn_2_bias = self.attn_2.attn_ob
+
+
 # Inspired from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/module_inject/replace_module.py#L201
-def deepspeed_injection(module, fp16=True, enable_cuda_graph=True):
+def deepspeed_injection(
+    module,
+    fp16=True,
+    enable_cuda_graph=True,
+    use_triton_attention=False
+):
 
     if not torch.cuda.is_available():
         logger.warn("You provided use_deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
         return
 
     def replace_attn(child, policy):
-        policy_attn = policy.attention(child)
+        policy_attn = policy.attention(child, use_triton_attention=use_triton_attention)
         if policy_attn is None:
             return child
+
         if len(policy_attn) == 5:
             qkvw, attn_ow, attn_ob, hidden_size, heads = policy_attn
         else:
             qw, kw, vw, attn_ow, attn_ob, hidden_size, heads = policy_attn
 
-        config = transformer_inference.DeepSpeedInferenceConfig(
-            hidden_size=hidden_size,
-            heads=heads,
-            fp16=fp16,
-            triangular_masking=False,
-            max_out_tokens=4096,
-        )
-        attn_module = DeepSpeedDiffusersAttention(config)
+        if use_triton_attention:
+            config = transformer_inference.DeepSpeedInferenceConfig(
+                hidden_size=hidden_size,
+                heads=heads,
+                fp16=fp16,
+                triangular_masking=False,
+                max_out_tokens=4096,
+            )
+            attn_module = DeepSpeedDiffusersAttention(config)
+        else:
+            attn_module = FlashAttention(
+                hidden_size=hidden_size,
+                heads=heads,
+                fp16=fp16,
+                hidden_size_out=vw.shape[-1],
+                max_out_tokens=4096,
+            )                
 
         def transpose(data):
             data = data.contiguous()
@@ -326,7 +465,7 @@ def deepspeed_injection(module, fp16=True, enable_cuda_graph=True):
     def replace_attn_block(child, policy):
         # Track DeepSpeed Issue: https://github.com/microsoft/DeepSpeed/issues/2681
         config = Diffusers2DTransformerConfig(int8_quantization=False)
-        return DeepSpeedDiffusersTransformerBlock(child, config)
+        return DeepSpeedFlashDiffusersTransformerBlock(child, config)
 
     new_policies = {
         CrossAttention: replace_attn,

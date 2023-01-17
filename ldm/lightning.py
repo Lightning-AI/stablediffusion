@@ -57,6 +57,7 @@ class LightningStableDiffusion(L.LightningModule):
         steps: Optional[int] = None,
         use_deepspeed: bool = False,
         enable_cuda_graph: bool = False,
+        use_triton_attention: bool = True,
         use_inference_context: bool = False,
     ):
         super().__init__()
@@ -73,8 +74,13 @@ class LightningStableDiffusion(L.LightningModule):
         self.model = instantiate_from_config(config.model)
         self.model.load_state_dict(state_dict, strict=False)
 
-        if use_deepspeed or enable_cuda_graph:
-            deepspeed_injection(self.model, fp16=fp16, enable_cuda_graph=enable_cuda_graph)
+        if use_deepspeed or enable_cuda_graph or use_triton_attention:
+            deepspeed_injection(
+                self.model,
+                fp16=fp16,
+                enable_cuda_graph=enable_cuda_graph,
+                use_triton_attention=use_triton_attention
+            )
 
         # Replace with 
         self.sampler = _SAMPLERS[sampler](self.model)

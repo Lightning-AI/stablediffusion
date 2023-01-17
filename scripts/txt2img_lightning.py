@@ -152,6 +152,11 @@ def parse_args():
         default=42,
         help="the seed (for reproducible sampling)",
     )
+    parser.add_argument(
+        "--use_triton_attention",
+        action='store_true',
+        help="whether to use triton attention",
+    )
     opt = parser.parse_args()
     return opt
 
@@ -171,12 +176,13 @@ def main(opt):
         use_deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
         enable_cuda_graph=True, # Currently enabled only for batch size 1.
         use_inference_context=False,
+        use_triton_attention=opt.use_triton_attention,
         steps=30,
     )
 
-    for batch_size in [1, 2, 4]:
+    for batch_size in [1]:
         if batch_size == 1:
-            t, max_memory, images = benchmark_fn(device, 10, 5, model.predict_step, prompts=opt.prompt, batch_idx=0)
+            t, max_memory, images = benchmark_fn(device, 1, 3, model.predict_step, prompts=opt.prompt, batch_idx=0)
         else:
             t, max_memory, images = benchmark_fn(device, 10, 5, model.predict_step, prompts=[opt.prompt] * batch_size, batch_idx=0)
         print(f"Average time {t} secs on batch size {batch_size}.")

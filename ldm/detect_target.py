@@ -1,4 +1,3 @@
-import os
 from subprocess import PIPE, Popen
 
 # Credits to AITemplate Team
