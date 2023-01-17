@@ -180,9 +180,9 @@ def main(opt):
         steps=30,
     )
 
-    for batch_size in [1]:
+    for batch_size in [1, 2, 4]:
         if batch_size == 1:
-            t, max_memory, images = benchmark_fn(device, 1, 3, model.predict_step, prompts=opt.prompt, batch_idx=0)
+            t, max_memory, images = benchmark_fn(device, 10, 5, model.predict_step, prompts=opt.prompt, batch_idx=0)
         else:
             t, max_memory, images = benchmark_fn(device, 10, 5, model.predict_step, prompts=[opt.prompt] * batch_size, batch_idx=0)
         print(f"Average time {t} secs on batch size {batch_size}.")
