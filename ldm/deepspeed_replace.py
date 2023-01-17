@@ -7,7 +7,6 @@ from functools import partial
 from dataclasses import dataclass
 import time
 from lightning_utilities.core.imports import package_available
-from torch import nn
 from ldm.modules.attention import CrossAttention, BasicTransformerBlock
 from ldm.models.diffusion.ddpm import DiffusionWrapper
 from ldm.models.autoencoder import AutoencoderKL
