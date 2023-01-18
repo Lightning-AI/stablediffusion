@@ -287,6 +287,12 @@ def _module_match(module):
 
 class FlashAttention(nn.Module):
 
+    """
+    Use https://github.com/HazyResearch/flash-attention Flash Attention Kernels.
+    
+    Note: The Flash Attention kernels are activate only when the head dimension is lower than 128 and no context tensor is provided. 
+    """
+
     def __init__(self, hidden_size: int, hidden_size_out: int, heads: int, fp16: bool = True, device: str = "cuda", max_out_tokens: int = 4096):
         super().__init__()
 
