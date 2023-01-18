@@ -416,6 +416,8 @@ def deepspeed_injection(
         return
 
     def replace_attn(child, policy):
+        nonlocal add_warning
+
         policy_attn = policy.attention(child, use_triton_attention=use_triton_attention)
         if policy_attn is None:
             return child
@@ -426,7 +428,6 @@ def deepspeed_injection(
             qw, kw, vw, attn_ow, attn_ob, hidden_size, heads = policy_attn
 
         if use_triton_attention:
-            nonlocal add_warning
             if not add_warning:
                 logger.warn("Using DeepSpeed Triton Flash Attention. Skipped if a context is provided or with dim head higher than 128.")
                 add_warning = True
@@ -439,7 +440,6 @@ def deepspeed_injection(
             )
             attn_module = DeepSpeedDiffusersAttention(config)
         else:
-            nonlocal add_warning
             if not add_warning:
                 logger.warn("Using Flash Attention. Skipped if a context is provided or with dim head higher than 128.")
                 add_warning = True
