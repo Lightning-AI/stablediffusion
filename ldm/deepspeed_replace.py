@@ -17,6 +17,9 @@ import math
 from torch import nn, einsum
 from einops import rearrange
 
+# TODO: Remove once resolved: https://github.com/microsoft/DeepSpeed/issues/2715
+torch.nn.Paramaeter = torch.nn.Parameter
+
 if package_available("deepspeed"):
     import deepspeed.ops.transformer as transformer_inference
     from deepspeed.ops.transformer.inference.diffusers_attention import DeepSpeedDiffusersAttention
