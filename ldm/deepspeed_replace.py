@@ -409,6 +409,8 @@ def deepspeed_injection(
     use_triton_attention=False
 ):
 
+    add_warning = False
+
     if not torch.cuda.is_available():
         logger.warn("You provided use_deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
         return
@@ -424,6 +426,10 @@ def deepspeed_injection(
             qw, kw, vw, attn_ow, attn_ob, hidden_size, heads = policy_attn
 
         if use_triton_attention:
+            nonlocal add_warning
+            if not add_warning:
+                logger.warn("Using DeepSpeed Triton Flash Attention. Skipped if a context is provided or with dim head higher than 128.")
+                add_warning = True
             config = transformer_inference.DeepSpeedInferenceConfig(
                 hidden_size=hidden_size,
                 heads=heads,
@@ -433,6 +439,10 @@ def deepspeed_injection(
             )
             attn_module = DeepSpeedDiffusersAttention(config)
         else:
+            nonlocal add_warning
+            if not add_warning:
+                logger.warn("Using Flash Attention. Skipped if a context is provided or with dim head higher than 128.")
+                add_warning = True
             attn_module = FlashAttention(
                 hidden_size=hidden_size,
                 heads=heads,
