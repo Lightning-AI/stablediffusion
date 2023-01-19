@@ -173,14 +173,14 @@ def main(opt):
         checkpoint_path=opt.ckpt,
         device=device,
         fp16=True, # Supported on GPU and CPU only, skipped otherwise.
-        use_deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
+        use_deepspeed=False, # Supported on Ampere and RTX, skipped otherwise.
         enable_cuda_graph=True, # Currently enabled only for batch size 1.
         use_inference_context=True,
-        use_triton_attention=opt.use_triton_attention,
+        use_triton_attention=None, #opt.use_triton_attention,
         steps=30,
     )
 
-    for batch_size in [2]:
+    for batch_size in [1, 2, 4]:
         if batch_size == 1:
             t, max_memory, images = benchmark_fn(device, 10, 5, model.predict_step, prompts=opt.prompt, batch_idx=0)
         else:
