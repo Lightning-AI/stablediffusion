@@ -178,7 +178,7 @@ class LightningStableDiffusion(L.LightningModule):
         if len(ts.shape) != 1:
             ts = ts.squeeze()
 
-        index = total_steps - steps - 1
+        index = total_steps - steps
 
         results = {}
 
