@@ -125,6 +125,89 @@ class LightningStableDiffusion(L.LightningModule):
                     pil_results = [Image.fromarray(x_sample) for x_sample in x_samples_ddim]
         return pil_results
 
+    def in_loop_predict_step(
+        self, inputs, total_steps=30, eta=0, unconditional_guidance_scale=7.5, x_T=None, ddim_use_original_steps=False,
+        callback=None, timesteps=None, quantize_denoised=False,
+        mask=None, x0=None, img_callback=None, log_every_t=100,
+        temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+        unconditional_conditioning=None, dynamic_threshold=None,
+        ucg_schedule=None
+    ):
+        if len(inputs) == 0:
+            return
+
+        # To be cached
+        shape = [4, self.initial_size, self.initial_size]
+        C, H, W = shape
+        unconditional_conditioning = self.model.get_learned_conditioning([""])
+        self.sampler.make_schedule(ddim_num_steps=total_steps, ddim_eta=eta, verbose=False)
+
+        # Pre-processing
+        indexed_prompts = [(index, value) for index, value in inputs.items() if isinstance(value, str)]
+
+        if indexed_prompts:
+            conditioning = self.model.get_learned_conditioning([e[1] for e in indexed_prompts])
+            conditioning_unbind = torch.unbind(conditioning)
+            for idx, (index, _) in enumerate(indexed_prompts):
+                if "step" not in inputs[index]:
+                    inputs[index] = {
+                        "conditioning": conditioning_unbind[idx].unsqueeze(0),
+                        "step": 0,
+                        "img": torch.randn((1, C, H, W), device=self.device)
+                    }
+
+        bs = len(inputs)
+        timesteps = self.sampler.ddim_timesteps
+        time_range = np.flip(timesteps)
+
+        img = torch.cat([v['img'] for v in inputs.values()])
+        conditioning = torch.cat([v['conditioning'] for v in inputs.values()])
+        steps = []
+        for v in inputs.values():
+            step = v['step']
+            tensor = torch.tensor(step, dtype=torch.long)
+            steps.append(tensor)
+        steps = torch.stack(steps)
+
+        ts = []
+        for v in inputs.values():
+            timestep = time_range[v['step']]
+            tensor = torch.tensor(timestep, device=self.device, dtype=torch.long)
+            ts.append(tensor)
+        ts = torch.stack(ts)
+        if len(ts.shape) != 1:
+            ts = ts.squeeze()
+
+        index = total_steps - steps - 1
+
+        results = {}
+
+        with autocast("cuda"):
+            img, _ = self.sampler.p_sample_ddim(img, conditioning, ts, index=index, use_original_steps=False,
+                                        quantize_denoised=False, temperature=temperature,
+                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                        corrector_kwargs=corrector_kwargs,
+                                        unconditional_guidance_scale=unconditional_guidance_scale,
+                                        unconditional_conditioning=unconditional_conditioning.repeat(bs, 1, 1),
+                                        dynamic_threshold=dynamic_threshold)
+            img_unbind = torch.unbind(img) 
+            for img, v in zip(img_unbind, inputs.values()):
+                v['step'] = v['step'] + 1
+                v['img'] = img.unsqueeze(0)
+
+        indexes = list(inputs)
+        for index in indexes:
+            if inputs[index]['step'] == total_steps:
+                img = inputs[index]["img"]
+                with autocast("cuda"):
+                    img = self.model.decode_first_stage(img)
+                img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
+                img = img.cpu().permute(0, 2, 3, 1).numpy()
+                img = (255.0 * img).astype(np.uint8)
+                results[index] = Image.fromarray(img[0])
+                del inputs[index]
+        return results
+
 
 class LightningStableImg2ImgDiffusion(L.LightningModule):
     def __init__(
