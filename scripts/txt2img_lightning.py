@@ -173,10 +173,10 @@ def main(opt):
         checkpoint_path=opt.ckpt,
         device=device,
         fp16=True, # Supported on GPU and CPU only, skipped otherwise.
-        use_deepspeed=False, # Supported on Ampere and RTX, skipped otherwise.
+        use_deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
         enable_cuda_graph=True, # Currently enabled only for batch size 1.
         use_inference_context=True,
-        use_triton_attention=None, #opt.use_triton_attention,
+        use_triton_attention=False, #opt.use_triton_attention,
         steps=30,
     )
 

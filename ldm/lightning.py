@@ -156,6 +156,8 @@ class LightningStableDiffusion(L.LightningModule):
                         "img": torch.randn((1, C, H, W), device=self.device)
                     }
 
+        print([e['step'] for e in inputs.values()])
+
         bs = len(inputs)
         timesteps = self.sampler.ddim_timesteps
         time_range = np.flip(timesteps)
