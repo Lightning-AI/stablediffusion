@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union, Optional
+from typing import List, Tuple, Union, Optional, Literal
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
@@ -55,10 +55,10 @@ class LightningStableDiffusion(L.LightningModule):
         fp16: bool = True,
         sampler: str = "ddim",
         steps: Optional[int] = None,
-        use_deepspeed: bool = False,
-        enable_cuda_graph: bool = False,
-        use_triton_attention: bool = True,
-        use_inference_context: bool = False,
+        deepspeed: bool = False,
+        cuda_graph: bool = False,
+        flash_attention: Optional[Literal['hazy', 'triton']] = None,
+        context: Optional[Literal['inference_mode', 'no_grad']] = None,
     ):
         super().__init__()
 
@@ -74,12 +74,12 @@ class LightningStableDiffusion(L.LightningModule):
         self.model = instantiate_from_config(config.model)
         self.model.load_state_dict(state_dict, strict=False)
 
-        if use_deepspeed or enable_cuda_graph or use_triton_attention:
+        if deepspeed or cuda_graph or flash_attention:
             deepspeed_injection(
                 self.model,
                 fp16=fp16,
-                enable_cuda_graph=enable_cuda_graph,
-                use_triton_attention=use_triton_attention
+                cuda_graph=cuda_graph,
+                flash_attention=flash_attention
             )
 
         # Replace with 
@@ -90,7 +90,7 @@ class LightningStableDiffusion(L.LightningModule):
 
         self.to(device, dtype=torch.float16 if fp16 else torch.float32)
         self.fp16 = fp16
-        self.use_inference_context = use_inference_context
+        self.context = context
 
     def predict_step(self, prompts: Union[List[str], str], batch_idx: int = 0):
         if isinstance(prompts, str):
@@ -98,8 +98,8 @@ class LightningStableDiffusion(L.LightningModule):
         batch_size = len(prompts)
 
         precision_scope = autocast if self.fp16 else nullcontext
-        inference = torch.inference_mode if torch.cuda.is_available() else torch.no_grad
-        inference = inference if self.use_inference_context else nullcontext
+        inference = torch.inference_mode if self.context == "inference_mode" else torch.no_grad
+        inference = inference if torch.cuda.is_available() else nullcontext
         with inference():
             with precision_scope("cuda"):
                 with self.model.ema_scope():
@@ -135,6 +135,9 @@ class LightningStableDiffusion(L.LightningModule):
     ):
         if len(inputs) == 0:
             return
+
+        inference = torch.inference_mode if self.context == "inference_mode" else torch.no_grad
+        inference = inference if torch.cuda.is_available() else nullcontext
 
         # To be cached
         shape = [4, self.initial_size, self.initial_size]
@@ -184,28 +187,30 @@ class LightningStableDiffusion(L.LightningModule):
 
         results = {}
 
-        with autocast("cuda"):
-            img, _ = self.sampler.p_sample_ddim(img, conditioning, ts, index=index, use_original_steps=False,
-                                        quantize_denoised=False, temperature=temperature,
-                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                        corrector_kwargs=corrector_kwargs,
-                                        unconditional_guidance_scale=unconditional_guidance_scale,
-                                        unconditional_conditioning=unconditional_conditioning.repeat(bs, 1, 1),
-                                        dynamic_threshold=dynamic_threshold)
-            img_unbind = torch.unbind(img) 
-            for img, v in zip(img_unbind, inputs.values()):
-                v['step'] = v['step'] + 1
-                v['img'] = img.unsqueeze(0)
+        with inference():
+            with autocast("cuda"):
+                img, _ = self.sampler.p_sample_ddim(img, conditioning, ts, index=index, use_original_steps=False,
+                                            quantize_denoised=False, temperature=temperature,
+                                            noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                            corrector_kwargs=corrector_kwargs,
+                                            unconditional_guidance_scale=unconditional_guidance_scale,
+                                            unconditional_conditioning=unconditional_conditioning.repeat(bs, 1, 1),
+                                            dynamic_threshold=dynamic_threshold)
+                img_unbind = torch.unbind(img) 
+                for img, v in zip(img_unbind, inputs.values()):
+                    v['step'] = v['step'] + 1
+                    v['img'] = img.unsqueeze(0)
 
         indexes = list(inputs)
         for index in indexes:
             if inputs[index]['step'] == total_steps:
                 img = inputs[index]["img"]
-                with autocast("cuda"):
-                    img = self.model.decode_first_stage(img)
-                img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
-                img = img.cpu().permute(0, 2, 3, 1).numpy()
-                img = (255.0 * img).astype(np.uint8)
+                with inference():
+                    with autocast("cuda"):
+                        img = self.model.decode_first_stage(img)
+                        img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
+                        img = img.cpu().permute(0, 2, 3, 1).numpy()
+                        img = (255.0 * img).astype(np.uint8)
                 results[index] = Image.fromarray(img[0])
                 del inputs[index]
         return results

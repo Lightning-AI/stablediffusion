@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 class InferenceEngine(InferenceEngine):
 
-    def __init__(self, *args, enable_cuda_graph_global: bool = False, **kwargs):
+    def __init__(self, *args, cuda_graph_global: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.enable_cuda_graph_global = enable_cuda_graph_global
+        self.cuda_graph_global = cuda_graph_global
 
     def forward(self, *inputs, **kwargs):
         """Execute forward propagation
@@ -50,11 +50,11 @@ class InferenceEngine(InferenceEngine):
             **kwargs: variable length keyword arguments
         """
         start = None
-        if self.model_profile_enabled and self.enable_cuda_graph_global:
+        if self.model_profile_enabled and self.cuda_graph_global:
             torch.cuda.synchronize()
             start = time.time()
 
-        if self.enable_cuda_graph_global:
+        if self.cuda_graph_global:
             if self.cuda_graph_created:
                 outputs = self._graph_replay(*inputs, **kwargs)
             else:
@@ -63,7 +63,7 @@ class InferenceEngine(InferenceEngine):
         else:
             outputs = self.module(*inputs, **kwargs)
 
-        if self.model_profile_enabled and self.enable_cuda_graph_global:
+        if self.model_profile_enabled and self.cuda_graph_global:
             torch.cuda.synchronize()
             duration = time.time() - start
             self._model_times.append(duration)
@@ -79,18 +79,18 @@ class CudaGraphRecord:
     kwargs = None
     output = None
     cuda_graph_created: bool = False
-    enable_cuda_graph: bool = True
+    cuda_graph: bool = True
 
 
 class CudaGraphBatchRecord(dict):
 
-    def __init__(self, enable_cuda_graph):
+    def __init__(self, cuda_graph):
         super().__init__()
-        self.enable_cuda_graph = enable_cuda_graph
+        self.cuda_graph = cuda_graph
 
     def __getitem__(self, key):
         if key not in self:
-            self[key] = CudaGraphRecord(enable_cuda_graph=self.enable_cuda_graph)
+            self[key] = CudaGraphRecord(cuda_graph=self.cuda_graph)
         for item, value in self.items():
             if item == key:
                 return value
@@ -103,7 +103,7 @@ class CudaGraphInferenceModule(torch.nn.Module):
 
     inference_methods = ["forward"]
 
-    def __init__(self, module, enable_cuda_graph = True, batch_sizes=[1]):
+    def __init__(self, module, cuda_graph = True, batch_sizes=[1]):
         super().__init__()
         self.module = module
         self.module.requires_grad_(requires_grad=False)
@@ -114,7 +114,7 @@ class CudaGraphInferenceModule(torch.nn.Module):
         for method_name in self.inference_methods:
             fn = getattr(self, f"_{method_name}")
             assert fn
-            self.cuda_graph_records[method_name] = CudaGraphBatchRecord(enable_cuda_graph=enable_cuda_graph)
+            self.cuda_graph_records[method_name] = CudaGraphBatchRecord(cuda_graph=cuda_graph)
             setattr(self, method_name, partial(self._apply_fn, fn=fn, graph_record=self.cuda_graph_records[method_name]))
 
     def __getattr__(self, key):
@@ -139,7 +139,7 @@ class CudaGraphInferenceModule(torch.nn.Module):
 
     def _apply_fn(self, *args, fn=None, graph_record=None,  **kwargs):
         batch_size = self.extract_batch_size(*args, **kwargs)
-        if batch_size in self.batch_sizes and graph_record[batch_size].enable_cuda_graph:
+        if batch_size in self.batch_sizes and graph_record[batch_size].cuda_graph:
             if graph_record[batch_size].cuda_graph_created:
                 outputs = self._graph_replay(graph_record[batch_size], *args, **kwargs)
             else:
@@ -224,17 +224,17 @@ class UNetPolicy(DSPolicy):
     def match(self, module):
         return isinstance(module, DiffusionWrapper)
 
-    def apply(self, module, enable_cuda_graph=True):
-        if enable_cuda_graph:
-            return ReplayCudaGraphUnet(module, enable_cuda_graph=enable_cuda_graph)
+    def apply(self, module, cuda_graph=True):
+        if cuda_graph:
+            return ReplayCudaGraphUnet(module, cuda_graph=cuda_graph)
         return module
 
-    def attention(self, client_module, use_triton_attention: bool = True):
+    def attention(self, client_module, flash_attention: str = "triton"):
         qw = client_module.to_q.weight
         kw = client_module.to_k.weight
         vw = client_module.to_v.weight
 
-        if use_triton_attention and qw.shape[1] == kw.shape[1]:
+        if flash_attention == "triton" and qw.shape[1] == kw.shape[1]:
             qkvw = torch.nn.Parameter(torch.cat((qw, kw, vw), dim=0), requires_grad=False)
 
             return qkvw, \
@@ -256,9 +256,9 @@ class VAEPolicy(DSPolicy):
     def match(self, module):
         return isinstance(module,  AutoencoderKL)
 
-    def apply(self, module, enable_cuda_graph=True):
-        if enable_cuda_graph:
-            return ReplayCudaGraphVAE(module, enable_cuda_graph=enable_cuda_graph)
+    def apply(self, module, cuda_graph=True):
+        if cuda_graph:
+            return ReplayCudaGraphVAE(module, cuda_graph=cuda_graph)
         return module
 
 
@@ -267,9 +267,9 @@ class ClipEncoderPolicy(DSPolicy):
     def match(self, module):
         return isinstance(module, FrozenCLIPEmbedder)
 
-    def apply(self, module, enable_cuda_graph=True):
-        if enable_cuda_graph:
-            return ReplayCudaGraphClipEncoder(module, enable_cuda_graph=enable_cuda_graph)
+    def apply(self, module, cuda_graph=True):
+        if cuda_graph:
+            return ReplayCudaGraphClipEncoder(module, cuda_graph=cuda_graph)
         return module
 
 
@@ -405,20 +405,24 @@ class DeepSpeedFlashDiffusersTransformerBlock(DeepSpeedDiffusersTransformerBlock
 def deepspeed_injection(
     module,
     fp16=True,
-    enable_cuda_graph=True,
-    use_triton_attention=False
+    cuda_graph=True,
+    flash_attention=None
 ):
 
     add_warning = False
 
     if not torch.cuda.is_available():
-        logger.warn("You provided use_deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
+        logger.warn("You provided deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
         return
 
     def replace_attn(child, policy):
         nonlocal add_warning
 
-        policy_attn = policy.attention(child, use_triton_attention=use_triton_attention)
+        if flash_attention is None:
+            return child
+
+        policy_attn = policy.attention(child, flash_attention=flash_attention)
+        
         if policy_attn is None:
             return child
 
@@ -427,7 +431,7 @@ def deepspeed_injection(
         else:
             qw, kw, vw, attn_ow, attn_ob, hidden_size, heads = policy_attn
 
-        if use_triton_attention:
+        if flash_attention == "triton":
             if not add_warning:
                 logger.warn("Using DeepSpeed Triton Flash Attention. Skipped if a context is provided or with dim head higher than 128.")
                 add_warning = True
@@ -447,7 +451,7 @@ def deepspeed_injection(
                 hidden_size=hidden_size,
                 heads=heads,
                 fp16=fp16,
-                hidden_size_out=vw.shape[-1],
+                hidden_size_out=hidden_size,
                 max_out_tokens=4096,
             )                
 
@@ -496,13 +500,13 @@ def deepspeed_injection(
                     setattr(module, name, replaced_module)
 
         if not package_available("deepspeed"):
-            logger.warn("You provided use_deepspeed=True but Deepspeed isn't installed. Skipping...")
+            logger.warn("You provided deepspeed=True but Deepspeed isn't installed. Skipping...")
         if _detect_cuda() not in ["80"]:
-            logger.warn("You provided use_deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
+            logger.warn("You provided deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
         else:
             _replace_module(sub_module, policy)
 
-        new_module = policy.apply(sub_module, enable_cuda_graph=enable_cuda_graph)
+        new_module = policy.apply(sub_module, cuda_graph=cuda_graph)
         print(f"**** found and replaced {name} w. {type(new_module)}")
         setattr(module, name, new_module)
 
