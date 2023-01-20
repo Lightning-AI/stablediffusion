@@ -15,6 +15,7 @@ from PIL import Image
 from io import BytesIO
 from contextlib import nullcontext
 from torch import autocast
+from copy import deepcopy
 from ldm.deepspeed_replace import deepspeed_injection, ReplayCudaGraphUnet
 import logging
 
@@ -136,18 +137,25 @@ class LightningStableDiffusion(L.LightningModule):
         if len(inputs) == 0:
             return
 
+        # Create the context managers
         inference = torch.inference_mode if self.context == "inference_mode" else torch.no_grad
         inference = inference if torch.cuda.is_available() else nullcontext
         precision_scope = autocast if self.fp16 else nullcontext
 
-        bs = len(inputs)
-
+        # Create the global state to keep track of the batched img, etc..
         if "global_state" not in inputs:
             inputs["global_state"] = {}
+
+        # Collect the current hashes
+        hashes = [v for v in list(inputs) if v != "global_state"]
+        inputs["global_state"]['hashes'] = hashes
+
+        bs = len(hashes)
 
         with inference():
             with precision_scope("cuda"):
 
+                # Setup the unconditional_conditioning tensor and sampler.
                 if not hasattr(self, "shape"):
                     # To be cached
                     self.shape = [4, self.initial_size, self.initial_size]
@@ -159,60 +167,68 @@ class LightningStableDiffusion(L.LightningModule):
                 # Pre-processing
                 indexed_prompts = [(index, value) for index, value in inputs.items() if isinstance(value, str)]
 
-                if indexed_prompts:
-                    conditioning = self.model.get_learned_conditioning([e[1] for e in indexed_prompts])
-                    conditioning_unbind = torch.unbind(conditioning)
-                    for idx, (index, _) in enumerate(indexed_prompts):
-                        if "step" not in inputs[index]:
-                            inputs[index] = {
-                                "conditioning": conditioning_unbind[idx].unsqueeze(0),
-                                "step": 0,
-                                "img": torch.randn((1, *self.shape), device=self.device)
-                            }
+                # Detect if there were an exit without new prompts.
+                if 'previous_hashes' in inputs["global_state"]:
+                    changed_hash = inputs["global_state"]['previous_hashes'] == inputs["global_state"]['hashes']
+                else:
+                    changed_hash = False
 
-                    # Unpack if the number of elements changed
+
+                # New prompts are passed.
+                if indexed_prompts or changed_hash:
+
+                    if indexed_prompts:
+                        conditioning = self.model.get_learned_conditioning([e[1] for e in indexed_prompts])
+                        conditioning_unbind = torch.unbind(conditioning)
+                        for idx, (index, _) in enumerate(indexed_prompts):
+                            if "step" not in inputs[index]:
+                                inputs[index] = {
+                                    "conditioning": conditioning_unbind[idx].unsqueeze(0),
+                                    "step": 0,
+                                    "img": torch.randn((1, *self.shape), device=self.device)
+                                }
+
+                    # Unpack if new prompt are added changed
                     if "img" in inputs["global_state"]:
+                        print("a")
                         imgs = torch.unbind(inputs["global_state"]['img'])
                         steps = torch.unbind(inputs["global_state"]['steps'])
 
-                        indexes = [v for v in list(inputs) if v != "global_state"]
-
-                        for index, hash in enumerate(indexes):
-                            img = imgs[index].unsqueeze(0)
-                            step = steps[index]
-
-                            inputs[indexes[hash]]['img'] = img
-                            inputs[indexes[hash]]['step'] = step
+                        for index, hash in enumerate(inputs["global_state"]['previous_hashes']):
+                            inputs[hash]['img'] = imgs[index].unsqueeze(0)
+                            inputs[hash]['step'] = steps[index]
 
                         del inputs["global_state"]['img']
 
                     # Re-create the tensors
                     if "img" not in inputs["global_state"]:
+                        print("b")
+                        # Concat the img and conditioning
                         inputs["global_state"]['img'] = torch.cat([v['img'] for k, v in inputs.items() if k != "global_state"]).contiguous()
                         inputs["global_state"]['conditioning'] = torch.cat([v['conditioning'] for k, v in inputs.items() if k != "global_state"]).contiguous()
                         inputs["global_state"]['unconditional_conditioning'] = self.unconditional_conditioning.repeat(bs, 1, 1).contiguous()
 
+                        # Generate the steps and stack them
                         steps = []
-                        values = [v for k, v in inputs.items() if k != "global_state"]
-                        for v in values:
+                        for hash in hashes:
+                            v = inputs[hash]
                             step = v['step']
                             tensor = torch.tensor(step, dtype=torch.long)
                             steps.append(tensor)
 
                         inputs["global_state"]['steps'] = torch.stack(steps)
-                    else:
-                        imgs = torch.unbind(inputs["global_state"]['img'])
-                        steps = torch.unbind(inputs["global_state"]['steps'])
 
-                        for index, match in enumerate(matches):
-                            img = imgs[index].unsqueeze(0)
-                            step = steps[index]
-
+                # Generate the alphas index and timesteps
                 inputs["global_state"]['index'] = total_steps - inputs["global_state"]['steps']
                 inputs["global_state"]['ts'] = self.time_range[inputs["global_state"]['steps']]
 
                 results = {}
 
+                # print(inputs["global_state"]['img'].shape)
+                # print(inputs["global_state"]['conditioning'].shape)
+                # print(inputs["global_state"]['unconditional_conditioning'].shape)
+
+                # Make a step with the sampler
                 img, _ = self.sampler.p_sample_ddim(
                     inputs["global_state"]['img'], inputs["global_state"]['conditioning'],
                     inputs["global_state"]['ts'], index=inputs["global_state"]['index'], use_original_steps=False,
@@ -224,15 +240,21 @@ class LightningStableDiffusion(L.LightningModule):
                     dynamic_threshold=dynamic_threshold
                 )
                 
+                # Store the result
                 inputs["global_state"]['img'] = img
+
+                # Increment the step
                 inputs["global_state"]['steps'] += 1
 
-                indexes = [v for v in list(inputs) if v != "global_state"]
+                print(inputs["global_state"]['steps'])
+
+                # Detect if any tensor needs to be extracted.
                 matches = inputs["global_state"]['steps'] == total_steps
                 if any(matches):
                     imgs = torch.unbind(inputs["global_state"]['img'])
                     steps = torch.unbind(inputs["global_state"]['steps'])
                     for index, match in enumerate(matches):
+                        hash = hashes[index]
                         img = imgs[index].unsqueeze(0)
                         step = steps[index]
                         if match:
@@ -241,12 +263,15 @@ class LightningStableDiffusion(L.LightningModule):
                             img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
                             img = img.cpu().permute(0, 2, 3, 1).numpy()
                             img = (255.0 * img).astype(np.uint8)
-                            results[index] = Image.fromarray(img[0])
-                            del inputs[indexes[index]]
+                            results[hash] = Image.fromarray(img[0])
+                            del inputs[hash]
                         else:
-                            inputs[indexes[index]]['img'] = img
-                            inputs[indexes[index]]['step'] = step
+                            inputs[hash]['img'] = img
+                            inputs[hash]['step'] = step
                     del inputs["global_state"]['img']
+                    inputs["global_state"]['previous_hashes'] = [k for k, m in zip(inputs["global_state"]['hashes'], matches) if not m]
+                else:
+                    inputs["global_state"]['previous_hashes'] = deepcopy(inputs["global_state"]['hashes'])
         return results
 
 
