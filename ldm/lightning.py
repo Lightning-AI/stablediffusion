@@ -134,21 +134,22 @@ class LightningStableDiffusion(L.LightningModule):
         unconditional_conditioning=None, dynamic_threshold=None,
         ucg_schedule=None
     ):
-        if len(inputs) == 0:
+        # Collect the current hashes
+        hashes = [v for v in list(inputs) if v != "global_state"]
+
+        # Create the global state to keep track of the batched img, etc..
+        if "global_state" not in inputs:
+            inputs["global_state"] = {}
+
+        inputs["global_state"]['hashes'] = hashes
+
+        if len(hashes) == 0:
             return
 
         # Create the context managers
         inference = torch.inference_mode if self.context == "inference_mode" else torch.no_grad
         inference = inference if torch.cuda.is_available() else nullcontext
         precision_scope = autocast if self.fp16 else nullcontext
-
-        # Create the global state to keep track of the batched img, etc..
-        if "global_state" not in inputs:
-            inputs["global_state"] = {}
-
-        # Collect the current hashes
-        hashes = [v for v in list(inputs) if v != "global_state"]
-        inputs["global_state"]['hashes'] = hashes
 
         bs = len(hashes)
 
@@ -169,10 +170,9 @@ class LightningStableDiffusion(L.LightningModule):
 
                 # Detect if there were an exit without new prompts.
                 if 'previous_hashes' in inputs["global_state"]:
-                    changed_hash = inputs["global_state"]['previous_hashes'] == inputs["global_state"]['hashes']
+                    changed_hash = inputs["global_state"]['previous_hashes'] != inputs["global_state"]['hashes']
                 else:
                     changed_hash = False
-
 
                 # New prompts are passed.
                 if indexed_prompts or changed_hash:
@@ -190,7 +190,6 @@ class LightningStableDiffusion(L.LightningModule):
 
                     # Unpack if new prompt are added changed
                     if "img" in inputs["global_state"]:
-                        print("a")
                         imgs = torch.unbind(inputs["global_state"]['img'])
                         steps = torch.unbind(inputs["global_state"]['steps'])
 
@@ -202,7 +201,6 @@ class LightningStableDiffusion(L.LightningModule):
 
                     # Re-create the tensors
                     if "img" not in inputs["global_state"]:
-                        print("b")
                         # Concat the img and conditioning
                         inputs["global_state"]['img'] = torch.cat([v['img'] for k, v in inputs.items() if k != "global_state"]).contiguous()
                         inputs["global_state"]['conditioning'] = torch.cat([v['conditioning'] for k, v in inputs.items() if k != "global_state"]).contiguous()
@@ -258,8 +256,7 @@ class LightningStableDiffusion(L.LightningModule):
                         img = imgs[index].unsqueeze(0)
                         step = steps[index]
                         if match:
-                            img = imgs[index]
-                            img = self.model.decode_first_stage(img.unsqueeze(0))
+                            img = self.model.decode_first_stage(img)
                             img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
                             img = img.cpu().permute(0, 2, 3, 1).numpy()
                             img = (255.0 * img).astype(np.uint8)
