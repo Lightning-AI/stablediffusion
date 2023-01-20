@@ -168,16 +168,18 @@ def main(opt):
 
     device = "cuda" if torch.cuda.is_available() else "mps"
 
+    steps = 30
+
     model = LightningStableDiffusion(
         config_path=opt.config,
         checkpoint_path=opt.ckpt,
         device=device,
         fp16=True, # Supported on GPU and CPU only, skipped otherwise.
-        use_deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
-        enable_cuda_graph=True, # Currently enabled only for batch size 1.
-        use_inference_context=True,
-        use_triton_attention=False, #opt.use_triton_attention,
-        steps=30,
+        deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
+        cuda_graph=True, # Currently enabled only for batch size 1.
+        context="no_grad",
+        flash_attention="hazy",
+        steps=steps,
     )
 
     for batch_size in [1, 2, 4]:

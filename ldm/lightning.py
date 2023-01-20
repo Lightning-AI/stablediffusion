@@ -138,81 +138,115 @@ class LightningStableDiffusion(L.LightningModule):
 
         inference = torch.inference_mode if self.context == "inference_mode" else torch.no_grad
         inference = inference if torch.cuda.is_available() else nullcontext
-
-        # To be cached
-        shape = [4, self.initial_size, self.initial_size]
-        C, H, W = shape
-        unconditional_conditioning = self.model.get_learned_conditioning([""])
-        self.sampler.make_schedule(ddim_num_steps=total_steps, ddim_eta=eta, verbose=False)
-
-        # Pre-processing
-        indexed_prompts = [(index, value) for index, value in inputs.items() if isinstance(value, str)]
-
-        if indexed_prompts:
-            conditioning = self.model.get_learned_conditioning([e[1] for e in indexed_prompts])
-            conditioning_unbind = torch.unbind(conditioning)
-            for idx, (index, _) in enumerate(indexed_prompts):
-                if "step" not in inputs[index]:
-                    inputs[index] = {
-                        "conditioning": conditioning_unbind[idx].unsqueeze(0),
-                        "step": 0,
-                        "img": torch.randn((1, C, H, W), device=self.device)
-                    }
-
-        print([e['step'] for e in inputs.values()])
+        precision_scope = autocast if self.fp16 else nullcontext
 
         bs = len(inputs)
-        timesteps = self.sampler.ddim_timesteps
-        time_range = np.flip(timesteps)
 
-        img = torch.cat([v['img'] for v in inputs.values()])
-        conditioning = torch.cat([v['conditioning'] for v in inputs.values()])
-        steps = []
-        for v in inputs.values():
-            step = v['step']
-            tensor = torch.tensor(step, dtype=torch.long)
-            steps.append(tensor)
-        steps = torch.stack(steps)
-
-        ts = []
-        for v in inputs.values():
-            timestep = time_range[v['step']]
-            tensor = torch.tensor(timestep, device=self.device, dtype=torch.long)
-            ts.append(tensor)
-        ts = torch.stack(ts)
-        if len(ts.shape) != 1:
-            ts = ts.squeeze()
-
-        index = total_steps - steps
-
-        results = {}
+        if "global_state" not in inputs:
+            inputs["global_state"] = {}
 
         with inference():
-            with autocast("cuda"):
-                img, _ = self.sampler.p_sample_ddim(img, conditioning, ts, index=index, use_original_steps=False,
-                                            quantize_denoised=False, temperature=temperature,
-                                            noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                            corrector_kwargs=corrector_kwargs,
-                                            unconditional_guidance_scale=unconditional_guidance_scale,
-                                            unconditional_conditioning=unconditional_conditioning.repeat(bs, 1, 1),
-                                            dynamic_threshold=dynamic_threshold)
-                img_unbind = torch.unbind(img) 
-                for img, v in zip(img_unbind, inputs.values()):
-                    v['step'] = v['step'] + 1
-                    v['img'] = img.unsqueeze(0)
+            with precision_scope("cuda"):
 
-        indexes = list(inputs)
-        for index in indexes:
-            if inputs[index]['step'] == total_steps:
-                img = inputs[index]["img"]
-                with inference():
-                    with autocast("cuda"):
-                        img = self.model.decode_first_stage(img)
-                        img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
-                        img = img.cpu().permute(0, 2, 3, 1).numpy()
-                        img = (255.0 * img).astype(np.uint8)
-                results[index] = Image.fromarray(img[0])
-                del inputs[index]
+                if not hasattr(self, "shape"):
+                    # To be cached
+                    self.shape = [4, self.initial_size, self.initial_size]
+                    self.unconditional_conditioning = self.model.get_learned_conditioning([""])
+                    self.sampler.make_schedule(ddim_num_steps=total_steps, ddim_eta=eta, verbose=False)
+                    timesteps = self.sampler.ddim_timesteps
+                    self.time_range = torch.tensor(np.flip(timesteps).tolist(), device=self.device)
+
+                # Pre-processing
+                indexed_prompts = [(index, value) for index, value in inputs.items() if isinstance(value, str)]
+
+                if indexed_prompts:
+                    conditioning = self.model.get_learned_conditioning([e[1] for e in indexed_prompts])
+                    conditioning_unbind = torch.unbind(conditioning)
+                    for idx, (index, _) in enumerate(indexed_prompts):
+                        if "step" not in inputs[index]:
+                            inputs[index] = {
+                                "conditioning": conditioning_unbind[idx].unsqueeze(0),
+                                "step": 0,
+                                "img": torch.randn((1, *self.shape), device=self.device)
+                            }
+
+                    # Unpack if the number of elements changed
+                    if "img" in inputs["global_state"]:
+                        imgs = torch.unbind(inputs["global_state"]['img'])
+                        steps = torch.unbind(inputs["global_state"]['steps'])
+
+                        indexes = [v for v in list(inputs) if v != "global_state"]
+
+                        for index, hash in enumerate(indexes):
+                            img = imgs[index].unsqueeze(0)
+                            step = steps[index]
+
+                            inputs[indexes[hash]]['img'] = img
+                            inputs[indexes[hash]]['step'] = step
+
+                        del inputs["global_state"]['img']
+
+                    # Re-create the tensors
+                    if "img" not in inputs["global_state"]:
+                        inputs["global_state"]['img'] = torch.cat([v['img'] for k, v in inputs.items() if k != "global_state"]).contiguous()
+                        inputs["global_state"]['conditioning'] = torch.cat([v['conditioning'] for k, v in inputs.items() if k != "global_state"]).contiguous()
+                        inputs["global_state"]['unconditional_conditioning'] = self.unconditional_conditioning.repeat(bs, 1, 1).contiguous()
+
+                        steps = []
+                        values = [v for k, v in inputs.items() if k != "global_state"]
+                        for v in values:
+                            step = v['step']
+                            tensor = torch.tensor(step, dtype=torch.long)
+                            steps.append(tensor)
+
+                        inputs["global_state"]['steps'] = torch.stack(steps)
+                    else:
+                        imgs = torch.unbind(inputs["global_state"]['img'])
+                        steps = torch.unbind(inputs["global_state"]['steps'])
+
+                        for index, match in enumerate(matches):
+                            img = imgs[index].unsqueeze(0)
+                            step = steps[index]
+
+                inputs["global_state"]['index'] = total_steps - inputs["global_state"]['steps']
+                inputs["global_state"]['ts'] = self.time_range[inputs["global_state"]['steps']]
+
+                results = {}
+
+                img, _ = self.sampler.p_sample_ddim(
+                    inputs["global_state"]['img'], inputs["global_state"]['conditioning'],
+                    inputs["global_state"]['ts'], index=inputs["global_state"]['index'], use_original_steps=False,
+                    quantize_denoised=False, temperature=temperature,
+                    noise_dropout=noise_dropout, score_corrector=score_corrector,
+                    corrector_kwargs=corrector_kwargs,
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    unconditional_conditioning=inputs["global_state"]['unconditional_conditioning'],
+                    dynamic_threshold=dynamic_threshold
+                )
+                
+                inputs["global_state"]['img'] = img
+                inputs["global_state"]['steps'] += 1
+
+                indexes = [v for v in list(inputs) if v != "global_state"]
+                matches = inputs["global_state"]['steps'] == total_steps
+                if any(matches):
+                    imgs = torch.unbind(inputs["global_state"]['img'])
+                    steps = torch.unbind(inputs["global_state"]['steps'])
+                    for index, match in enumerate(matches):
+                        img = imgs[index].unsqueeze(0)
+                        step = steps[index]
+                        if match:
+                            img = imgs[index]
+                            img = self.model.decode_first_stage(img.unsqueeze(0))
+                            img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
+                            img = img.cpu().permute(0, 2, 3, 1).numpy()
+                            img = (255.0 * img).astype(np.uint8)
+                            results[index] = Image.fromarray(img[0])
+                            del inputs[indexes[index]]
+                        else:
+                            inputs[indexes[index]]['img'] = img
+                            inputs[indexes[index]]['step'] = step
+                    del inputs["global_state"]['img']
         return results
 
 

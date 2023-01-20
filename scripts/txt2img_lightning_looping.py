@@ -4,8 +4,7 @@ import time
 import torch
 from pytorch_lightning import seed_everything
 from ldm.lightning import LightningStableDiffusion
-import numpy as np
-from torch import autocast
+import uuid
 
 def benchmark_fn(device, iters: int, warm_up_iters: int, function, *args, **kwargs) -> float:
     """
@@ -56,6 +55,27 @@ def benchmark_fn(device, iters: int, warm_up_iters: int, function, *args, **kwar
         return (start_event.elapsed_time(end_event)) / iters, max_memory, results
     else:
         return (time.time() - t0) / iters, None, results
+
+def inference_step(model, prompt, batch_size, steps):
+    data = {0: {uuid.uuid4().hex: prompt for _ in range(batch_size)}}
+    num_samples = len([k for v in data.values() for k in v])
+    
+    idx = 0
+    inputs = {}
+    results = {}
+    while True:
+        for timestamp in data:
+            if timestamp <= idx:
+                for k, v in data[timestamp].items():
+                    if k not in results and k not in inputs:
+                        inputs[k] = v
+        results.update(model.in_loop_predict_step(inputs, steps))
+        idx += 1
+
+        if len(results) == num_samples:
+            break
+
+    return results.values()
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -169,44 +189,28 @@ def main(opt):
 
     device = "cuda" if torch.cuda.is_available() else "mps"
 
+    steps = 30
+
     model = LightningStableDiffusion(
         config_path=opt.config,
         checkpoint_path=opt.ckpt,
         device=device,
         fp16=True, # Supported on GPU and CPU only, skipped otherwise.
-        use_deepspeed=False, # Supported on Ampere and RTX, skipped otherwise.
-        enable_cuda_graph=False, # Currently enabled only for batch size 1.
-        use_inference_context=True,
-        use_triton_attention=opt.use_triton_attention,
-        steps=30,
+        deepspeed=True, # Supported on Ampere and RTX, skipped otherwise.
+        cuda_graph=True, # Currently enabled only for batch size 1.
+        context="no_grad",
+        flash_attention="hazy",
+        steps=steps,
     )
 
-    data = {
-        0: {"a": opt.prompt, "b": opt.prompt},
-        5: {"c": opt.prompt},
-        10: {"d": opt.prompt},
-    }
-    num_samples = len([k for v in data.values() for k in v])
-    
-    idx = 0
-    inputs = {}
-    results = {}
-    while True:
-        for timestamp in data:
-            if timestamp <= idx:
-                for k, v in data[timestamp].items():
-                    if k not in results and k not in inputs:
-                        inputs[k] = v
-        results.update(model.in_loop_predict_step(inputs, 30))
-        print(idx, list(results))
-        idx += 1
-
-        if len(results) == num_samples:
-            break
+    for batch_size in [1, 2, 4]:
+        t, max_memory, images = benchmark_fn(device, 10, 5, inference_step, model=model, prompt=opt.prompt, batch_size=batch_size, steps=steps)
+        print(f"Average time {t} secs on batch size {batch_size}.")
+        print(f"Max GPU Memory cost is {max_memory} MB.")
 
     grid_count = len(os.listdir(opt.outdir)) - 1
 
-    for image in results.values():
+    for image in images:
         image.save(os.path.join(opt.outdir, f'grid-lightning-{opt.sampler}-{grid_count:04}.png'))
         grid_count += 1
 
