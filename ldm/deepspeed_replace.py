@@ -501,7 +501,7 @@ def deepspeed_injection(
 
         if not package_available("deepspeed"):
             logger.warn("You provided deepspeed=True but Deepspeed isn't installed. Skipping...")
-        if _detect_cuda() not in ["80"]:
+        if _detect_cuda() not in ["75", "80"]:
             logger.warn("You provided deepspeed=True but Deepspeed isn't supported on your architecture. Skipping...")
         else:
             _replace_module(sub_module, policy)
