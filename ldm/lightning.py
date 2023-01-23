@@ -60,8 +60,15 @@ class LightningStableDiffusion(L.LightningModule):
         cuda_graph: bool = False,
         flash_attention: Optional[Literal['hazy', 'triton']] = None,
         context: Optional[Literal['inference_mode', 'no_grad']] = None,
+        # depreceated arguments
+        use_deepspeed: bool = None,
+
     ):
         super().__init__()
+
+        if use_deepspeed is not None:
+            logger.warn(f"The argument `use_deepspeed` is depreceated and will be removed soon.")
+            deepspeed = use_deepspeed
 
         if device in ("mps", "cpu") and fp16:
             logger.warn(f"You provided fp16=True but it isn't supported on `{device}`. Skipping...")
