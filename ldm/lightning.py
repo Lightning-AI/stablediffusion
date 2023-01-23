@@ -67,7 +67,7 @@ class LightningStableDiffusion(L.LightningModule):
         super().__init__()
 
         if use_deepspeed is not None:
-            logger.warn(f"The argument `use_deepspeed` is depreceated and will be removed soon.")
+            logger.warn(f"The argument `use_deepspeed` is depreceated and will be removed soon. Use `deepspeed={use_deepspeed}` instead.")
             deepspeed = use_deepspeed
 
         if device in ("mps", "cpu") and fp16:
