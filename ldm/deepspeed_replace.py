@@ -34,6 +34,9 @@ else:
     class DSPolicy:
         pass
 
+    class DeepSpeedDiffusersTransformerBlock:
+        pass
+
 logger = logging.getLogger(__name__)
 
 class InferenceEngine(InferenceEngine):
